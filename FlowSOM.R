@@ -86,14 +86,13 @@ if(args$transform == "logicle"){
 }
 
 fsom <- ReadInput(flowSet.trans, transform = FALSE, scale = FALSE)
-set.seed(1234)
 
 colsToUse <- which(targets$name %in% lineage_markers[lineage_markers %in% targets$name[targets$Ignore == 0]] == T)
 
 som <- BuildSOM(fsom,
                 colsToUse = targets$name[colsToUse],
-                xdim = length(colsToUse),
-                ydim = length(colsToUse))
+                xdim = 23,
+                ydim = 23)
 
 flowSOM.res <- BuildMST(som)
 
@@ -238,7 +237,8 @@ phenotyped_table <- phenotyped_list %>%
   bind_rows(.id = "cell_desc") %>%
   pivot_wider(names_from = cell_desc,
               values_from = val,
-              values_fill = 0L)
+              values_fill = 0L) |>
+  mutate(root_unassigned = 0)
 
 profile_list <- read_csv("immunophenotypes-profiling-database-2024-may-08.csv") %>%
   select(-notes) %>%
@@ -280,10 +280,8 @@ profiled_table <- lapply(phenotyped_list, function(phenotyped_df){
     filter(!is.na(map)) %>%
     pivot_wider(names_from = cell_desc,
                         values_from = val,
-                        values_fill = 0L)
-
-compartment_table <- phenotyped_table %>%
-    select(map, `B Cell_1`, `T Cell_1`, `Myeloid_1`, `NK Cell_1`, `Granulocyte Basophil_1`)
+                        values_fill = 0L) |>
+  mutate(root_unassigned = 0)
 
 #### write out results ####
 dir.create(paste0(RESULTS_DIR, "CLUSTERED_FCS/"),
@@ -296,43 +294,40 @@ lapply(file, function(files){
     mutate(map = c(1:nrow(.))) %>%
     dplyr::filter(FileNames == files) %>%
     select(map, Mapping, DistToNode, cyttools_dim_x, cyttools_dim_y) %>%
-    mutate(root_unassigned = if_else(map %in% phenotyped_table$map, 0L, 1L)) %>%
     left_join(phenotyped_table, by = "map") %>%
+    mutate(root_unassigned = if_else(is.na(root_unassigned), 1L, root_unassigned)) %>%
+    left_join(phenotype_matrix |>
+      as.data.frame() |>
+      setNames(paste(colnames(phenotype_matrix), "gate", sep = ".")) |>
+      mutate(map = c(1:nrow(.))),
+      by = "map") |>
     select(-map) %>%
     mutate(across(all_of(colnames(phenotyped_table)[-1]),
       ~if_else(is.na(.x), 0, .x)))
   
-  # assignment.csv (Rows are channels, columns are population descriptions, values are median signal intensity.)
+    # assignment.csv (Rows are channels, columns are population descriptions, values are median signal intensity.)
 
-  ResultsTable %>%
-    mutate(map = c(1:nrow(.))) %>%
-    tibble() %>%
-    dplyr::filter(FileNames == files) %>%
-    select(map, all_of(colsToUse)) %>%
-    mutate(root_unassigned = if_else(map %in% phenotyped_table$map, 0L, 1L)) %>%
-    left_join(phenotyped_table, by = "map") %>%
-    select(-map) %>%
-    mutate(across(all_of(colnames(phenotyped_table)[-1]),
-      ~if_else(is.na(.x), 0, .x))) %>%
-    pivot_longer(ends_with("Di"),
-        names_to = "name",
-        values_to = "MSI"
-        ) %>%
-    pivot_longer(-c(name, MSI),
-        names_to = "CellSubset",
-        values_to = "subset_status") %>%
-    filter(subset_status == 1) %>%
-    group_by(name, CellSubset) %>%
-    summarise(MSI = median(MSI)) %>%
-    ungroup() %>%
-    left_join(targets %>%
-        select(name, descOriginal) %>%
-        setNames(c("name", "Channel")),
-        by = "name") %>%
-    select(-name) %>%
-    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) %>%
-    pivot_wider(names_from = CellSubset,
-        values_from = "MSI") %>%
+  msi_table <- ResultsTable |>
+    dplyr::filter(FileNames == files) |>
+    select(ends_with("Di"))
+
+  subset_table <- clusterData |>
+    select(all_of(colnames(phenotyped_table)[-1]))
+
+  assignment_median_values <- lapply(subset_table, function(population_index){
+    sapply(msi_table[population_index == 1,], median)
+  })
+
+  assignment_median_values |>
+    lapply(as.data.frame) |>
+    lapply(rownames_to_column, "name") |>
+    lapply(left_join, targets |>
+        select(name, descOriginal) |>
+        setNames(c("name", "Channel"))) |>
+    lapply(dplyr::select, -name) |>
+    lapply(pivot_wider, names_from = Channel, values_from = `X[[i]]`) |>
+    bind_rows(.id = "CellSubset") |>
+    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) |>
     write_csv(paste0(RESULTS_DIR,
                      "CLUSTERED_FCS/clustered_",
                      str_replace(basename(files),
@@ -341,8 +336,7 @@ lapply(file, function(files){
   cat("assignment.csv written successfully \n")
 # cell_counts_assignment.csv (Rows are cell subsets, column is cell counts)
 
-  clusterData %>%
-    select(-c(Mapping:cyttools_dim_y)) %>%
+  subset_table %>%
     colSums() %>%
     as.data.frame() %>%
     setNames("count") %>%
@@ -357,23 +351,19 @@ lapply(file, function(files){
   cat("cell_counts_assignment.csv written successfully \n")
 # cell_counts_compartment.csv (Rows are cell compartments, column is cell counts)
 
-  ResultsTable %>%
-    mutate(map = c(1:nrow(.))) %>%
-    tibble() %>%
-    dplyr::filter(FileNames == files) %>%
-    select(map, all_of(colsToUse)) %>%
-    mutate(root_unassigned = if_else(map %in% compartment_table$map, 0L, 1L)) %>%
-    left_join(compartment_table, by = "map") %>%
-    select(-map) %>%
-    mutate(across(all_of(colnames(compartment_table)[-1]),
-      ~if_else(is.na(.x), 0, .x))) %>%
-    select(c(root_unassigned, all_of(colnames(compartment_table)[-1]))) %>%
+  subset_table %>%
     colSums() %>%
     as.data.frame() %>%
     setNames("count") %>%
     rownames_to_column("CellSubset") %>%
     transmute(CellSubset = str_remove(CellSubset, "\\_1$"),
       N = count) %>%
+    filter(CellSubset %in% c("root_unassigned",
+           "B Cell",
+           "T Cell",
+           "Myeloid",
+           "NK Cell",
+           "Granulocyte Basophil")) |>
     write_csv(paste0(RESULTS_DIR,
                      "CLUSTERED_FCS/clustered_",
                      str_replace(basename(files),
@@ -382,35 +372,22 @@ lapply(file, function(files){
   cat("cell_counts_compartment.csv written successfully \n")
 # compartment.csv (Rows are channels, columns are compartment descriptions, values are median signal intensity.)
 
-  ResultsTable %>%
-    mutate(map = c(1:nrow(.))) %>%
-    tibble() %>%
-    dplyr::filter(FileNames == files) %>%
-    select(map, all_of(colsToUse)) %>%
-    mutate(root_unassigned = if_else(map %in% compartment_table$map, 0L, 1L)) %>%
-    left_join(compartment_table, by = "map") %>%
-    select(-map) %>%
-    mutate(across(all_of(colnames(compartment_table)[-1]),
-      ~if_else(is.na(.x), 0, .x))) %>%
-    pivot_longer(ends_with("Di"),
-        names_to = "name",
-        values_to = "MSI"
-        ) %>%
-    pivot_longer(-c(name, MSI),
-        names_to = "CellSubset",
-        values_to = "subset_status") %>%
-    filter(subset_status == 1) %>%
-    group_by(name, CellSubset) %>%
-    summarise(MSI = median(MSI)) %>%
-    ungroup() %>%
-    left_join(targets %>%
-        select(name, descOriginal) %>%
-        setNames(c("name", "Channel")),
-        by = "name") %>%
-    select(-name) %>%
-    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) %>%
-    pivot_wider(names_from = CellSubset,
-        values_from = "MSI") %>%
+  assignment_median_values |>
+    lapply(as.data.frame) |>
+    lapply(rownames_to_column, "name") |>
+    lapply(left_join, targets |>
+        select(name, descOriginal) |>
+        setNames(c("name", "Channel"))) |>
+    lapply(dplyr::select, -name) |>
+    lapply(pivot_wider, names_from = Channel, values_from = `X[[i]]`) |>
+    bind_rows(.id = "CellSubset") |>
+    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) |>
+    filter(CellSubset %in% c("root_unassigned",
+           "B Cell",
+           "T Cell",
+           "Myeloid",
+           "NK Cell",
+           "Granulocyte Basophil")) |>
     write_csv(paste0(RESULTS_DIR,
                      "CLUSTERED_FCS/clustered_",
                      str_replace(basename(files),
@@ -419,35 +396,30 @@ lapply(file, function(files){
   cat("compartment.csv written successfully \n")
 # profiling.csv (Rows are channels, columns are profiled cell subsets, values are median signal intensity)
 
-  ResultsTable %>%
+  subset_table <- ResultsTable %>%
     mutate(map = c(1:nrow(.))) %>%
-    tibble() %>%
     dplyr::filter(FileNames == files) %>%
-    select(map, all_of(colsToUse)) %>%
-    mutate(root_unassigned = if_else(map %in% profiled_table$map, 0L, 1L)) %>%
+    select(map, Mapping, DistToNode, cyttools_dim_x, cyttools_dim_y) %>%
     left_join(profiled_table, by = "map") %>%
-    select(-map) %>%
+    mutate(root_unassigned = if_else(is.na(root_unassigned), 1L, root_unassigned)) %>%
     mutate(across(all_of(colnames(profiled_table)[-1]),
-      ~if_else(is.na(.x), 0, .x))) %>%
-    pivot_longer(ends_with("Di"),
-        names_to = "name",
-        values_to = "MSI"
-        ) %>%
-    pivot_longer(-c(name, MSI),
-        names_to = "CellSubset",
-        values_to = "subset_status") %>%
-    filter(subset_status == 1) %>%
-    group_by(name, CellSubset) %>%
-    summarise(MSI = median(MSI)) %>%
-    ungroup() %>%
-    left_join(targets %>%
-        select(name, descOriginal) %>%
-        setNames(c("name", "Channel")),
-        by = "name") %>%
-    select(-name) %>%
-    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) %>%
-    pivot_wider(names_from = CellSubset,
-        values_from = "MSI") %>%
+      ~if_else(is.na(.x), 0, .x))) |>
+    select(all_of(colnames(profiled_table)[-1]))
+
+  assignment_median_values <- lapply(subset_table, function(population_index){
+    sapply(msi_table[population_index == 1,], median)
+  })
+
+  assignment_median_values |>
+    lapply(as.data.frame) |>
+    lapply(rownames_to_column, "name") |>
+    lapply(left_join, targets |>
+        select(name, descOriginal) |>
+        setNames(c("name", "Channel"))) |>
+    lapply(dplyr::select, -name) |>
+    lapply(pivot_wider, names_from = Channel, values_from = `X[[i]]`) |>
+    bind_rows(.id = "CellSubset") |>
+    mutate(CellSubset = str_remove(CellSubset, "\\_1$")) |>
     write_csv(paste0(RESULTS_DIR,
                      "CLUSTERED_FCS/clustered_",
                      str_replace(basename(files),
@@ -460,12 +432,12 @@ lapply(file, function(files){
     tibble() %>%
     dplyr::filter(FileNames == files) %>%
     select(map, all_of(colsToUse)) %>%
-    mutate(root_unassigned = if_else(map %in% profiled_table$map, 0L, 1L)) %>%
     left_join(profiled_table, by = "map") %>%
+    mutate(root_unassigned = if_else(is.na(root_unassigned), 1L, root_unassigned)) %>%
     select(-map) %>%
     mutate(across(all_of(colnames(profiled_table)[-1]),
       ~if_else(is.na(.x), 0, .x))) %>%
-    select(all_of(colnames(profiled_table)[-1])) %>%
+    select(root_unassigned, all_of(colnames(profiled_table)[-1])) %>%
     colSums() %>%
     as.data.frame() %>%
     setNames("count") %>%
